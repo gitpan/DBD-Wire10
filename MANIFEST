@@ -1,0 +1,4 @@
+MANIFEST
+Makefile.PL
+META.yml
+lib/DBD/Wire10.pm
