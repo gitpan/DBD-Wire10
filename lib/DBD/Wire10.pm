@@ -12,7 +12,7 @@ use warnings;
 use DBI;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '1.00';
+$VERSION = '1.01';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -101,6 +101,8 @@ use strict;
 use warnings;
 use Net::Wire10;
 
+# TODO: Add support for take_imp_data() and connect({dbi_imp_data=>...}).
+#       AFAICT, these are only supported for native C drivers at the moment.
 $DBD::Wire10::dr::imp_data_size = 0;
 
 sub connect {
@@ -150,9 +152,14 @@ use warnings;
 
 $DBD::Wire10::db::imp_data_size = 0;
 
+# Probably degrades performance quite a bit for large values, necessary due to a server bug:
+# http://bugs.mysql.com/bug.php?id=1337
+my $workaround_bug_1337 = qr/^[0-9]+$/;
+
 sub quote {
 	my $dbh = shift;
 	my ($statement, $type) = @_;
+	return $statement if defined $statement and $statement =~ $workaround_bug_1337;
 	return Net::Wire10::Util::quote($statement);
 }
 
@@ -186,6 +193,8 @@ sub STORE {
 	if ($key =~ /^AutoCommit$/) {
 		my $wire = $dbh->FETCH('wire10_driver_dbh');
 		$wire->query("SET AUTOCOMMIT=".$value);
+		# Can't store as AutoCommit via SUPER::STORE, not sure why.
+		$dbh->STORE('wire10_autocommit', $value);
 		return 1;
 	}
 
@@ -222,6 +231,11 @@ sub FETCH {
 		return $wire->{debug};
 	}
 
+	if ($key =~ /^AutoCommit$/) {
+		# See comment in STORE.
+		return $dbh->FETCH('wire10_autocommit');
+	}
+
 	return $dbh->{$key} if $key =~ /^(?:wire10_.*)$/;
 	return $dbh->SUPER::FETCH($key);
 }
@@ -229,7 +243,7 @@ sub FETCH {
 sub commit {
 	my $dbh = shift;
 
-	if (! $dbh->FETCH('AutoCommit')) {
+	if ($dbh->FETCH('AutoCommit')) {
 		if ($dbh->FETCH('Warn')) {
 			warn 'Commit ineffective while AutoCommit is on';
 		}
@@ -244,7 +258,7 @@ sub commit {
 sub rollback {
 	my $dbh = shift;
 
-	if (! $dbh->FETCH('AutoCommit')) {
+	if ($dbh->FETCH('AutoCommit')) {
 		if ($dbh->FETCH('Warn')) {
 			warn 'Rollback ineffective while AutoCommit is on';
 		}
@@ -290,6 +304,7 @@ sub reconnect {
 			$dbh->STORE('wire10_thread_id', $wire->{server_thread_id});
 			$dbh->STORE('wire10_server_version', $wire->{server_version});
 			$dbh->STORE('Active', 1);
+			$dbh->STORE('AutoCommit', $dbh->FETCH('AutoCommit'));
 		};
 		if ($wire->is_error) {
 			$dbh->DBI::set_err($wire->get_error_code || -1, $wire->get_error_message, $wire->get_error_state);
@@ -408,40 +423,39 @@ sub execute {
 	}
 
 	print "Finished statement: " . $prepared . "\n" if $wire->{debug} & 1;
-	my $result = eval {
+	my $rowcount = eval {
 		$sth->finish;
-		$wire->query($prepared);
+		my $res = $wire->query($prepared);
 
 		die if $wire->is_error;
 
-		$sth->STORE('wire10_warning_count', $wire->get_warning_count);
+		$sth->STORE('wire10_warning_count', $res->get_warning_count);
 		# For backward compatibility and/or do(), store in dbh too.
 		my $dbh = $sth->{Database};
-		$dbh->STORE('wire10_warning_count', $wire->get_warning_count);
+		$dbh->STORE('wire10_warning_count', $res->get_warning_count);
 
-		if ($wire->has_results) {
-			my $iterator = $wire->create_result_iterator;
-			$sth->{wire10_iterator} = $iterator;
-			$sth->STORE('NUM_OF_FIELDS', $iterator->get_no_of_columns);
-			$sth->STORE('NAME', [ $iterator->get_column_names ]);
+		if ($res->has_results) {
+			$sth->{wire10_iterator} = $res;
+			$sth->STORE('NUM_OF_FIELDS', $res->get_no_of_columns);
+			$sth->STORE('NAME', [ $res->get_column_names ]);
 			# DBI docs says this is important
 			# for bind_columns and bind_cols.
 			$sth->STORE('Active', 1);
 			# DBI docs say set this to -1.
 			$sth->{wire10_rows} = -1;
-			$sth->STORE('wire10_selectedrows', $wire->get_no_of_selected_rows);
+			$sth->STORE('wire10_selectedrows', $res->get_no_of_selected_rows);
 			# For backward compatibility and/or do(), store in dbh too.
-			$dbh->STORE('wire10_selectedrows', $wire->get_no_of_selected_rows);
+			$dbh->STORE('wire10_selectedrows', $res->get_no_of_selected_rows);
 		} else {
 			$sth->{wire10_iterator} = undef;
 			$sth->STORE('NUM_OF_FIELDS', 0);
 			$sth->STORE('NAME', []);
-			$sth->{wire10_rows} = $wire->get_no_of_affected_rows;
-			$sth->STORE('wire10_insertid', $wire->get_insert_id);
+			$sth->{wire10_rows} = $res->get_no_of_affected_rows;
+			$sth->STORE('wire10_insertid', $res->get_insert_id);
 			# For backward compatibility and/or do(), store in dbh too.
-			$dbh->STORE('wire10_insertid', $wire->get_insert_id);
+			$dbh->STORE('wire10_insertid', $res->get_insert_id);
 		}
-		return $wire->get_no_of_affected_rows;
+		return $res->get_no_of_affected_rows;
 	};
 
 	if ($wire->is_error) {
@@ -452,7 +466,7 @@ sub execute {
 		return undef;
 	}
 
-	return $result ? $result : '0E0';
+	return $rowcount ? $rowcount : '0E0';
 }
 
 sub cancel {
@@ -715,6 +729,8 @@ Some methods have default implementations in DBI, those are not listed here.  Re
 
 Quotes a string literal.
 
+MySQL Server chokes if you give it LIMIT parameters that are properly quoted.  To work around this, the quote() method specifically does not quote purely numerical values.  To quote all values, including numerical values, use Net::Wire10::Util::quote().
+
 =head4 quote_identifier
 
 Quotes a schema identifier such as database or table names.
@@ -824,6 +840,10 @@ Used internally to notify DBI that connect() has been called and disconnect() ha
 =head4 wire10_driver_dbh (internal)
 
 This is the internal handle for the core driver object associated with the DBI connection.
+
+=head4 wire10_autocommit (internal)
+
+Used internally to store the current AutoCommit setting.
 
 =head2 Features in C<DBD::Wire10::st>
 
@@ -1017,6 +1037,10 @@ The following methods are supposed to be implemented by each DBD driver, but is 
 
 =over 4
 
+=item * bind_col
+
+=item * bind_columns
+
 =item * bind_param_inout
 
 =back
@@ -1057,9 +1081,9 @@ If streaming is turned on in the DBD driver (by switching internally from query(
 
 The wire protocol does not have any means by which the server can tell the client how many rows are in the result set, even if the server should discover this at some point.  Therefore the row count is only available after the entire result set has been pulled down to the client.
 
-=head2 Using tokens for C<LIMIT>s in prepared statements
+=head2 Using tokens for LIMITs in prepared statements
 
-MySQL Server chokes if you give it LIMIT parameters that are properly quoted.  There is currently no support for parsing for the LIMIT statement and foregoing or removing quoting.  Therefore, using tokens for LIMIT parameters when connected to a MySQL Server does not currently work.  Drizzle may have the same problem, since it derives from the same code base as MySQL Server.
+MySQL Server chokes if you give it LIMIT parameters that are properly quoted.  As a workaround, this DBD driver scans all field values given to it, and when a purely numerical value is found, it is not quoted.
 
 =head2 Dependencies
 
