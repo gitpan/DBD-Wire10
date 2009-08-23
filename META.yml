@@ -1,10 +1,10 @@
 --- #YAML:1.0
 name:                DBD-Wire10
-version:             1.01
+version:             1.02
 distribution_type:   module
 requires:     
     DBI:                           0
-    Net::Wire10:                 1.01
+    Net::Wire10:                 1.02
 meta-spec:
     url:     http://module-build.sourceforge.net/META-spec-v1.3.html
     version: 1.3

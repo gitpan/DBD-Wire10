@@ -5,6 +5,6 @@ WriteMakefile(
 	VERSION_FROM        => 'lib/DBD/Wire10.pm',
 	PREREQ_PM           => {
 		DBI              => 0.0,
-		Net::Wire10      => 1.01,
+		Net::Wire10      => 1.02,
 	},
 );

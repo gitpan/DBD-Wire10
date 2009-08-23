@@ -1,4 +1,4 @@
-﻿# TODO: Find out why DBI croaks under PerlSvc when DBD::Wire10 and Net::Wire10
+# TODO: Find out why DBI croaks under PerlSvc when DBD::Wire10 and Net::Wire10
 #       files are in UTF-8 (with BOM), this prevents using Unicode for the POD docs.
 
 # TODO: Put in a place where people expect to find this driver, maybe alias
@@ -12,7 +12,7 @@ use warnings;
 use DBI;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '1.01';
+$VERSION = '1.02';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -152,14 +152,9 @@ use warnings;
 
 $DBD::Wire10::db::imp_data_size = 0;
 
-# Probably degrades performance quite a bit for large values, necessary due to a server bug:
-# http://bugs.mysql.com/bug.php?id=1337
-my $workaround_bug_1337 = qr/^[0-9]+$/;
-
 sub quote {
 	my $dbh = shift;
 	my ($statement, $type) = @_;
-	return $statement if defined $statement and $statement =~ $workaround_bug_1337;
 	return Net::Wire10::Util::quote($statement);
 }
 
@@ -362,6 +357,7 @@ package DBD::Wire10::st;
 
 use strict;
 use warnings;
+use DBI qw(:sql_types);
 
 $DBD::Wire10::st::imp_data_size = 0;
 
@@ -369,63 +365,72 @@ $DBD::Wire10::st::imp_data_size = 0;
 sub _constructor {
 	my $sth = shift;
 	my $wire = shift;
-	my $statement = shift;
+	my $sql = shift;
 
-	# Find all "?" placeholders in query.
-	my @tokens = Net::Wire10::Util::tokenize($statement);
+	my $ps = $wire->prepare($sql);
 
 	# Store driver handle and prepared statement for later.
 	$sth->STORE('wire10_driver_sth', $wire);
-	$sth->STORE('wire10_tokenized', \@tokens);
-	$sth->STORE('wire10_params', []);
-	$sth->STORE('NUM_OF_PARAMS', scalar grep(/^\?$/, @tokens));
+	$sth->STORE('wire10_prepared', $ps);
+	$sth->STORE('NUM_OF_PARAMS', $ps->get_marker_count);
 }
 
 sub bind_param {
 	my $sth = shift;
 	my ($index, $value, $attr) = @_;
-	# No quoting here - everything is copied and quoted in execute().
-	my $params = $sth->FETCH('wire10_params');
-	$params->[$index - 1] = $value;
+	my $binary = _test_for_binary_flag($sth, $attr);
+	my $ps = $sth->FETCH('wire10_prepared');
+	$ps->set_parameter($index, $value, $binary);
 	return 1;
+}
+
+sub _test_for_binary_flag {
+	my $sth = shift;
+	my $attr = shift;
+	return 0 unless defined $attr;
+	my $binary = Net::Wire10::DATA_BINARY;
+	my $text = Net::Wire10::DATA_TEXT;
+	my $sqltype;
+	# May be undefined.
+	$sqltype = $attr if ref($attr) eq '';
+	$sqltype = $attr->{TYPE} if ref($attr) eq 'HASH';
+	if (defined $sqltype) {
+		return $binary if $sqltype == SQL_BINARY;
+		return $binary if $sqltype == SQL_VARBINARY;
+		return $binary if $sqltype == SQL_LONGVARBINARY;
+		return $binary if $sqltype == SQL_BLOB;
+	}
+	# For testing Oracle-based code with MySQL.
+	# ORA_BLOB is 113, defined in Oracle.h.
+	my $oratype;
+	$oratype = $attr->{ora_type} if ref($attr) eq 'HASH';
+	return $binary if defined $oratype and $oratype == 113;
+	return $text;
 }
 
 sub execute {
 	my $sth = shift;
-	my @bind_values = @_;
+	my @new_params = @_;
 	my $dbh = $sth->{Database};
-	my $tokens = $sth->{wire10_tokenized};
-	my $params = (@bind_values) ? \@bind_values : $sth->FETCH('wire10_params');
-	my $num_params = $sth->FETCH('NUM_OF_PARAMS');
 	my $wire = $sth->FETCH('wire10_driver_sth');
+	my $ps = $sth->FETCH('wire10_prepared');
 
-	unless (defined($tokens)) {
+	unless (defined($ps)) {
 		$sth->DBI::set_err(-1, "execute without prepare");
 		return undef;
 	}
 
-	if (@$params != $num_params) {
-		$sth->DBI::set_err(
-			-1,
-			"cannot execute prepared statement with ".
-			($params ? @$params : 'none').
-			" tokens using $num_params parameters"
-		);
-		return undef;
+	if (scalar(@new_params) > 0) {
+		$ps->clear_parameter;
+		my $i = 1;
+		foreach my $p (@new_params) {
+			$ps->set_parameter($i++, $p, 0);
+		}
 	}
 
-	# replace tokens with parameters.
-	my $prepared = '';
-	my $i = 0;
-	foreach my $token (@$tokens) {
-		$prepared .= $dbh->quote($params->[$i++]) if $token eq '?';
-		$prepared .= $token if $token ne '?';
-	}
-
-	print "Finished statement: " . $prepared . "\n" if $wire->{debug} & 1;
 	my $rowcount = eval {
 		$sth->finish;
-		my $res = $wire->query($prepared);
+		my $res = $ps->query;
 
 		die if $wire->is_error;
 
@@ -488,7 +493,7 @@ sub cancel {
 sub finish {
 	my $sth = shift;
 	my $dbh = $sth->{Database};
-	# Always working in store_result mode, so no need to do anything.
+	# Always working in non-streaming mode, so no need to flush.
 	$sth->{wire10_iterator} = undef;
 	$sth->STORE('Active', 0);
 	$sth->SUPER::finish();
@@ -853,6 +858,12 @@ Used internally to store the current AutoCommit setting.
 
 Given an index and a value, binds that value to the parameter at the given index in the prepared statement.  Use after prepare() and before execute().
 
+To bind binary data to a parameter, specify a type such as SQL_BLOB.  This prevents the data from being considered Latin-1 or Unicode text.  Example:
+
+  $sth->bind_param(1, $mydata, SQL_BLOB);
+
+Parameters are numbered beginning from 1.
+
 =head4 execute
 
 Runs a prepared statement, optionally using parameters.  Parameters are supplied either via bind_param(), or directly in the call to execute().  When parameters are given in the call to execute(), they override earlier bound parameters for the duration of the call.
@@ -947,15 +958,11 @@ Used internally to store a reference to the core driver object.
 
 =head4 wire10_iterator (internal)
 
-User internally to store a reference to the active result iterator, if any.
+Used internally to store a reference to the active result iterator, if any.
 
-=head4 wire10_tokenized (internal)
+=head4 wire10_prepared (internal)
 
-Used internally to store a prepared statement.
-
-=head4 wire10_params (internal)
-
-Used internally to store bound parameters.
+Used internally to store a reference to the prepared statement created by the core driver.
 
 =head4 wire10_rows (internal)
 
