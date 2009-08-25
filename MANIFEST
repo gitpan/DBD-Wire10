@@ -1,4 +1,9 @@
+Build.PL
+Changes
 MANIFEST
-Makefile.PL
 META.yml
+README
 lib/DBD/Wire10.pm
+t/00-load.t
+t/pod-coverage.t
+t/pod.t

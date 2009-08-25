@@ -12,7 +12,7 @@ use warnings;
 use DBI;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '1.02';
+$VERSION = '1.03';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -41,7 +41,6 @@ sub driver {
 	$drh = DBI::_new_drh($class, {
 		Name        => 'Wire10',
 		Version     => $VERSION,
-		Attribution => 'DBD::Wire10, see AUTHOR',
 	}, {});
 	return $drh;
 }
@@ -101,8 +100,7 @@ use strict;
 use warnings;
 use Net::Wire10;
 
-# TODO: Add support for take_imp_data() and connect({dbi_imp_data=>...}).
-#       AFAICT, these are only supported for native C drivers at the moment.
+# Note: rather undocumented, for now blindly hoping that 0 means auto-detect.
 $DBD::Wire10::dr::imp_data_size = 0;
 
 sub connect {
@@ -117,16 +115,23 @@ sub connect {
 
 	my $dbh = DBI::_new_dbh($drh, { Name => $dsn });
 	eval {
-		my $wire = Net::Wire10->new(
-			host     => $data_source_info->{host},
-			port     => $data_source_info->{port},
-			database => $data_source_info->{database},
-			user     => $user,
-			password => $password,
-			debug    => $attrhash->{wire10_debug} || undef,
-			timeout  => $attrhash->{wire10_timeout} || undef,
-		);
-		$wire->connect;
+		# TODO: Probably necessary to tell perl to allow sharing
+		#       the imp_data object between threads somehow,
+		#       either via threads::shared or Storable.
+		#       See also note in take_imp_data().
+		my $wire = delete $attrhash->{dbi_imp_data};
+		unless (defined $wire) {
+			$wire = Net::Wire10->new(
+				host     => $data_source_info->{host},
+				port     => $data_source_info->{port},
+				database => $data_source_info->{database},
+				user     => $user,
+				password => $password,
+				debug    => $attrhash->{wire10_debug} || undef,
+				timeout  => $attrhash->{wire10_timeout} || undef,
+			);
+			$wire->connect;
+		};
 		$dbh->STORE('wire10_driver_dbh', $wire);
 		$dbh->STORE('wire10_thread_id', $wire->{server_thread_id});
 		$dbh->STORE('wire10_server_version', $wire->{server_version});
@@ -315,7 +320,7 @@ sub reconnect {
 sub disconnect {
 	my $dbh = shift;
 	my $wire = $dbh->FETCH('wire10_driver_dbh');
-	$wire->disconnect;
+	$wire->disconnect if defined $wire;
 	$dbh->STORE('wire10_thread_id', undef);
 	$dbh->STORE('Active', 0);
 	return 1;
@@ -349,6 +354,45 @@ sub get_info {
 	return 0 if $type == 114;
 	# Unknown/unsupported attribute.
 	return undef;
+}
+
+sub take_imp_data {
+	my $dbh = shift;
+
+	# Finish any active statements (important if streaming enabled).
+	for my $sth (@{$dbh->{ChildHandles} || []}) {
+		next unless $sth;
+		$sth->finish if $sth->{Active};
+	}
+
+	# Take out core driver and remove reference to it.
+	my $wire = $dbh->FETCH('wire10_driver_dbh');
+	$dbh->STORE('wire10_driver_dbh', undef);
+
+	# Remove reference to dbh from drh, probably also destroys dbh.
+	$dbh->SUPER::take_imp_data;
+
+	# TODO: Probably necessary to tell perl to allow sharing of imp_data
+	#       between threads somehow, either via threads::shared::share()
+	#       which unfortunately requires you to manually walk the entire
+	#       tree of objects, or via Storable::{freeze,thaw}() which
+	#       unfortunately needs you to manually handle all typeglobs.
+	#
+	#       Either dependency would perhaps defeat the purpose of having
+	#       a pure perl database driver, since both threads::shared and
+	#       Storable are partly written in C.
+
+	# Note: Another issue slightly related to the above is if it
+	#       is even possible to install the PurePerl version of
+	#       DBI without compiling the C version, since the PurePerl
+	#       .pm file is distributed in the same CPAN package as the C
+	#       version of DBI.  Probably for historical reasons since
+	#       (the shared?) DBI.pm also lives there.  This will
+	#       probably effectively stop every package installer out
+	#       there in its PurePerl efforts when C compilation fails.
+
+	# Return the core driver.
+	return $wire;
 }
 
 
@@ -493,10 +537,12 @@ sub cancel {
 sub finish {
 	my $sth = shift;
 	my $dbh = $sth->{Database};
-	# Always working in non-streaming mode, so no need to flush.
+	# If in streaming mode, flush remaining results.
+	my $iterator = $sth->{wire10_iterator};
+	$iterator->spool if defined $iterator;
 	$sth->{wire10_iterator} = undef;
 	$sth->STORE('Active', 0);
-	$sth->SUPER::finish();
+	$sth->SUPER::finish;
 }
 
 sub fetchrow_arrayref {
@@ -669,7 +715,7 @@ After that you can connect to servers and send queries via a simple object orien
   while (my $ref = $sth->fetchrow_arrayref()) {
     print "Found a row: id = $ref->[0], name = $ref->[1]\n";
   }
-  $sth->finish();
+  $sth->finish;
 
 =head2 Example: disconnect
 
@@ -715,6 +761,8 @@ C<wire10_debug> can be specified in the attribute hash for very noise debug outp
 C<wire10_timeout> can be specified in the attribute hash to set a connect and query timeout.  Otherwise, the driver's default values are used.
 
 C<Warn> can be specified to 1 in the attribute hash to output warnings when some silly things are attempted.
+
+C<ShowErrorStatement> can be specified to 1 in the attribute hash to include the prepared statement in output when an error occurs.
 
 C<RaiseError> can be specified to 1 in the attribute hash to enable error handling.  Use C<eval { ... };> guard blocks to catch errors.  After the guard block, the special variable $@ is either undefined or contains an error message.
 
@@ -784,6 +832,10 @@ Contains an SQLSTATE code when an error has happened.
 
 Contains an error message when an error has happened.  Always use RaiseError and eval {} to catch errors in production code.
 
+=head4 take_imp_data (internal)
+
+Retrieves a reference to the core driver object and nukes the DBI handle that previously owned it.
+
 =head4 STORE (internal)
 
 Used internally to store attributes.
@@ -807,6 +859,12 @@ Enables or disables automatic commit after each query, in effect wrapping each q
 =head4 Warn
 
 If enabled, warnings are emitted when unexpected things might occur.
+
+=head4 ShowErrorStatement
+
+If enabled, the prepared statement stored by the driver upon a call to prepare() is included in the output when an error occurs.
+
+Using absolute notation such as C<SELECT * FROM db.table> rather than C<USE db> combined with C<SELECT * FROM table> will give more precise debug output (and perform better).
 
 =head4 wire10_timeout
 
@@ -862,7 +920,9 @@ To bind binary data to a parameter, specify a type such as SQL_BLOB.  This preve
 
   $sth->bind_param(1, $mydata, SQL_BLOB);
 
-Parameters are numbered beginning from 1.
+Parameters are numbered beginning from 1.  SQL types are defined as optional exports in DBI:
+
+  use DBI qw(:sql_types);
 
 =head4 execute
 
@@ -1019,8 +1079,6 @@ Should return a list of table and view names, possibly including a schema prefix
 =item * list_tables
 
 =item * last_insert_id
-
-=item * take_imp_data
 
 =back
 
