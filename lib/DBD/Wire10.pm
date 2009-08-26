@@ -12,7 +12,7 @@ use warnings;
 use DBI;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '1.03';
+$VERSION = '1.04';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -278,8 +278,9 @@ sub ping {
 		$wire->ping;
 	};
 
-	if ($wire->is_error) {
-		$dbh->DBI::set_err($wire->get_error_code || -1, $wire->get_error_message, $wire->get_error_state);
+	my $error = $wire->get_error_info;
+	if ($error) {
+		$dbh->DBI::set_err($error->get_error_code || -1, $error->get_error_message, $error->get_error_state);
 	} elsif ($@) {
 		$dbh->DBI::set_err(-1, $@);
 	}
@@ -306,8 +307,9 @@ sub reconnect {
 			$dbh->STORE('Active', 1);
 			$dbh->STORE('AutoCommit', $dbh->FETCH('AutoCommit'));
 		};
-		if ($wire->is_error) {
-			$dbh->DBI::set_err($wire->get_error_code || -1, $wire->get_error_message, $wire->get_error_state);
+		my $error = $wire->get_error_info;
+		if ($error) {
+			$dbh->DBI::set_err($error->get_error_code || -1, $error->get_error_message, $error->get_error_state);
 			return 0;
 		} elsif ($@) {
 			$dbh->DBI::set_err(-1, $@);
@@ -476,7 +478,7 @@ sub execute {
 		$sth->finish;
 		my $res = $ps->query;
 
-		die if $wire->is_error;
+		die if $wire->get_error_info;
 
 		$sth->STORE('wire10_warning_count', $res->get_warning_count);
 		# For backward compatibility and/or do(), store in dbh too.
@@ -485,8 +487,8 @@ sub execute {
 
 		if ($res->has_results) {
 			$sth->{wire10_iterator} = $res;
-			$sth->STORE('NUM_OF_FIELDS', $res->get_no_of_columns);
-			$sth->STORE('NAME', [ $res->get_column_names ]);
+			$sth->STORE('NUM_OF_FIELDS', scalar $res->get_column_info("name"));
+			$sth->STORE('NAME', [$res->get_column_info("name")]);
 			# DBI docs says this is important
 			# for bind_columns and bind_cols.
 			$sth->STORE('Active', 1);
@@ -507,8 +509,9 @@ sub execute {
 		return $res->get_no_of_affected_rows;
 	};
 
-	if ($wire->is_error) {
-		$sth->DBI::set_err($wire->get_error_code || -1, $wire->get_error_message, $wire->get_error_state);
+	my $error = $wire->get_error_info;
+	if ($error) {
+		$sth->DBI::set_err($error->get_error_code || -1, $error->get_error_message, $error->get_error_state);
 		return undef;
 	} elsif ($@) {
 		$sth->DBI::set_err(-1, $@);
@@ -1039,6 +1042,17 @@ This module has been tested on these OSes.
 =item * Windows Server 2008
 
 with ActivePerl 5.10.0 build 1004, 32 and 64-bit
+
+The build script dependencies do not contain any version numbers, because
+nobody has any clue what the minimum requirements are for using this package.
+It is very recommendable, however, not to mix and match versions of C<Net::Wire10>
+and C<DBD::Wire10>.  For best results use the newest version of both packages.
+
+Over at CPAN Testers, there's a vast number of testers that do
+a very good job of figuring out which versions work together:
+L<http://static.cpantesters.org/distro/N/DBD-Wire10.html>
+
+Feel free to send in reports of success or failure using different platforms.
 
 =back
 
