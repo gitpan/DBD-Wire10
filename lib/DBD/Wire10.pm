@@ -12,7 +12,7 @@ use warnings;
 use DBI;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '1.04';
+$VERSION = '1.05';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -307,6 +307,7 @@ sub reconnect {
 			$dbh->STORE('Active', 1);
 			$dbh->STORE('AutoCommit', $dbh->FETCH('AutoCommit'));
 		};
+		# Return 0 on failure.
 		my $error = $wire->get_error_info;
 		if ($error) {
 			$dbh->DBI::set_err($error->get_error_code || -1, $error->get_error_message, $error->get_error_state);
@@ -315,8 +316,11 @@ sub reconnect {
 			$dbh->DBI::set_err(-1, $@);
 			return 0;
 		}
+		# Return 1 if connection was reestablished.
+		return 1;
 	}
-	return 1;
+	# Return -1 if nothing besides a protocol ping was done.
+	return -1;
 }
 
 sub disconnect {
@@ -476,7 +480,8 @@ sub execute {
 
 	my $rowcount = eval {
 		$sth->finish;
-		my $res = $ps->query;
+		my $stream_results = $sth->FETCH('wire10_streaming') || 0;
+		my $res = $stream_results ? $ps->stream : $ps->query;
 
 		die if $wire->get_error_info;
 
@@ -499,7 +504,7 @@ sub execute {
 			$dbh->STORE('wire10_selectedrows', $res->get_no_of_selected_rows);
 		} else {
 			$sth->{wire10_iterator} = undef;
-			$sth->STORE('NUM_OF_FIELDS', 0);
+			$sth->STORE('NUM_OF_FIELDS', undef);
 			$sth->STORE('NAME', []);
 			$sth->{wire10_rows} = $res->get_no_of_affected_rows;
 			$sth->STORE('wire10_insertid', $res->get_insert_id);
@@ -987,6 +992,14 @@ Contains the number of rows returned in the last result set.
 
   my $numRows = $sth->{wire10_selectedrows};
 
+=head4 wire10_streaming
+
+If this is set to 1 (or any value that evaluates to true), results will be streamed from the server rather than downloaded all at once, when the statement is executed.
+
+  $sth->{wire10_streaming} = 1;
+
+Notice that the underlying protocol has a limitation: when a streaming statement is active, no other statements can execute on the same connection.
+
 =head4 wire10_warning_count
 
 Contains the number of warnings produced by the last query.
@@ -1062,7 +1075,7 @@ DBI has a rich set of reference features, some of which are not implemented by e
 
 In general, it should be possible to check for particular features before using them with the can() method, available on all types of DBI handles, and raise an error if a required feature is not supported.
 
-Here is a list of some notable features that this driver does not have.
+Here is a list of some notable features that this driver does not yet have.
 
 See also the documentation for L<Net::Wire10/Unsupported features> for limitations in the driver core.
 
@@ -1148,21 +1161,51 @@ The following attributes are supposed to be implemented by each DBD driver, but 
 
 =back
 
-=head2 Return value of C<execute('SELECT * from something')>
+=head2 Supported workarounds
 
-B<DBD::Wire10> returns true on success, and false on failure, as specified in DBI documentation.  This differs from B<DBD::mysql>, which returns the number of selected rows.
+=head3 Using tokens for LIMITs in prepared statements
+
+MySQL Server chokes if you give it LIMIT parameters that are properly quoted.  As a workaround, this DBD driver scans all field values given to it, and when a purely numerical value is found, it is not quoted.
+
+=head2 Differences from DBD-MySQL
+
+=head3 Binary data must be bound
+
+Binary/BLOB data must be given as a bound parameter (see C<bind_param>) using fx. the C<SQL_BLOB> flag.  When using any other method, strings will as a default be interpreted as text.
+
+=head3 Finding the number of selected rows
+
+The C<rows> attribute on a statement always returns -1, as specified in the DBI documentation.  A custom attribute, C<wire10_selectedrows>, is available to retrieve the number of selected rows.
+
+The same applies to the return value of C<execute('SELECT * FROM ...')>.  B<DBD::Wire10> returns true on success, and false on failure, as specified in DBI documentation.  This differs from B<DBD::mysql>, which returns the number of selected rows.
 
 To get the number of rows from a SELECT statement, use this:
 
   my $numRows = $sth->{wire10_selectedrows};
 
-If streaming is turned on in the DBD driver (by switching internally from query() to stream()), the above functionality would be disabled, and -1 would be returned every time.
+If streaming is turned on for the statement, the number of rows selected is unknown and the above always returns -1.
 
 The wire protocol does not have any means by which the server can tell the client how many rows are in the result set, even if the server should discover this at some point.  Therefore the row count is only available after the entire result set has been pulled down to the client.
 
-=head2 Using tokens for LIMITs in prepared statements
+=head3 Enabling streaming
 
-MySQL Server chokes if you give it LIMIT parameters that are properly quoted.  As a workaround, this DBD driver scans all field values given to it, and when a purely numerical value is found, it is not quoted.
+The C<mysql_use_result> attribute is unavailable.  Another attribute, C<wire10_streaming>, does exactly the same.
+
+=head3 Flipping result set with more_results()
+
+The C<more_results()> method currently does nothing, because the underlying driver does not yet support queries that return multiple result sets.
+
+As an alternative, grab two (or more) connections from the connection pool and execute one query on each connection simultaneously.  This also has the advantage that the queries can be executed in parallel.
+
+=head3 No implicit reconnects
+
+Automatic reconnection is not performed when a connection fails mid-execution.  The corresponding DBD-MySQL options C<auto_reconnect> and C<mysql_init_command> are therefore unavailable.
+
+The driver expects you to call C<reconnect()> at any time you wish to check the connection status and (if need be) reestablish a connection with the server.
+
+=head3 No type guessing
+
+No automatic conversion between types are done.  Weird string values are not interpreted as numbers when bound and specified as SQL_INTEGER, and vice-versa.
 
 =head2 Dependencies
 
