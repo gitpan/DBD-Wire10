@@ -12,6 +12,9 @@ use Module::Build;
 #
 # $ perl Build.PL
 #
+# (Notice that above, a script named "Build.PL" is used, while
+#  below a different script named "Build" is used.)
+#
 # Then choose an action from this list:
 #
 # $ perl Build help
@@ -34,8 +37,11 @@ my $builder = Module::Build->new(
 		'Test::More'         => 0.0,
 	},
 	requires => {
-		'DBI'                => 0.0,
+		'DBI::PurePerl'      => 0.0,
 		'Net::Wire10'        => 0.0,
+	},
+	recommends => {
+		'DBI'                => 0.0,
 	},
 	create_makefile_pl => 'traditional',
 );

@@ -12,7 +12,7 @@ use warnings;
 use DBI;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '1.05';
+$VERSION = '1.06';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -117,8 +117,7 @@ sub connect {
 	eval {
 		# TODO: Probably necessary to tell perl to allow sharing
 		#       the imp_data object between threads somehow,
-		#       either via threads::shared or Storable.
-		#       See also note in take_imp_data().
+		#       see note in take_imp_data().
 		my $wire = delete $attrhash->{dbi_imp_data};
 		unless (defined $wire) {
 			$wire = Net::Wire10->new(
@@ -338,6 +337,12 @@ sub DESTROY {
 	$dbh->SUPER::DESTROY;
 }
 
+sub last_insert_id {
+	my $dbh = shift;
+	return $dbh->FETCH('wire10_insertid')
+}
+
+# TODO: Support more get_info properties.
 sub get_info {
 	my $dbh = shift;
 	my $type = shift;
@@ -384,18 +389,9 @@ sub take_imp_data {
 	#       tree of objects, or via Storable::{freeze,thaw}() which
 	#       unfortunately needs you to manually handle all typeglobs.
 	#
-	#       Either dependency would perhaps defeat the purpose of having
-	#       a pure perl database driver, since both threads::shared and
-	#       Storable are partly written in C.
-
-	# Note: Another issue slightly related to the above is if it
-	#       is even possible to install the PurePerl version of
-	#       DBI without compiling the C version, since the PurePerl
-	#       .pm file is distributed in the same CPAN package as the C
-	#       version of DBI.  Probably for historical reasons since
-	#       (the shared?) DBI.pm also lives there.  This will
-	#       probably effectively stop every package installer out
-	#       there in its PurePerl efforts when C compilation fails.
+	#       Either dependency would perhaps defeat the some of the
+	#       purpose of having a pure perl database driver, since both
+	#       threads::shared and Storable are partly written in C.
 
 	# Return the core driver.
 	return $wire;
@@ -492,26 +488,39 @@ sub execute {
 
 		if ($res->has_results) {
 			$sth->{wire10_iterator} = $res;
-			$sth->STORE('NUM_OF_FIELDS', scalar $res->get_column_info("name"));
-			$sth->STORE('NAME', [$res->get_column_info("name")]);
-			# DBI docs says this is important
-			# for bind_columns and bind_cols.
+			my @names = $res->get_column_info("name");
+			$sth->STORE('NUM_OF_FIELDS', scalar @names);
+			$sth->STORE('NAME', [@names]);
+			my @flags = $res->get_column_info("flags");
+			my @nullable = map { ! $_ & Net::Wire10::COLUMN_NOT_NULL } @flags;
+			$sth->STORE('NULLABLE', [@nullable]);
+			# DBI docs says this is important for bind_columns and bind_cols.
 			$sth->STORE('Active', 1);
-			# DBI docs say set this to -1.
-			$sth->{wire10_rows} = -1;
-			$sth->STORE('wire10_selectedrows', $res->get_no_of_selected_rows);
-			# For backward compatibility and/or do(), store in dbh too.
-			$dbh->STORE('wire10_selectedrows', $res->get_no_of_selected_rows);
+			# Note: Emulate DBD-MySQL by not resetting insertid in dbh (only sth).
+			$sth->STORE('wire10_insertid', undef);
+			$sth->{wire10_rows} = $res->get_no_of_selected_rows;
+			return $res->get_no_of_selected_rows;
 		} else {
 			$sth->{wire10_iterator} = undef;
 			$sth->STORE('NUM_OF_FIELDS', undef);
-			$sth->STORE('NAME', []);
-			$sth->{wire10_rows} = $res->get_no_of_affected_rows;
-			$sth->STORE('wire10_insertid', $res->get_insert_id);
+			$sth->STORE('NAME', undef);
+			$sth->STORE('NULLABLE', undef);
+			my $insertid;
+			eval {
+				$insertid = $res->get_insert_id;
+			};
+			if ($@) {
+				# If the insert_id is too big for this Perl to handle,
+				# extract it using an alternate method.
+				my $res = $wire->query('SELECT LAST_INSERT_ID()');
+				$insertid = $res->next_array()->[0] || 0;
+			}
+			$sth->STORE('wire10_insertid', $insertid);
 			# For backward compatibility and/or do(), store in dbh too.
-			$dbh->STORE('wire10_insertid', $res->get_insert_id);
+			$dbh->STORE('wire10_insertid', $insertid);
+			$sth->{wire10_rows} = $res->get_no_of_affected_rows;
+			return $res->get_no_of_affected_rows;
 		}
-		return $res->get_no_of_affected_rows;
 	};
 
 	my $error = $wire->get_error_info;
@@ -599,6 +608,7 @@ sub FETCH {
 	my $key = shift;
 
 	return $sth->{NAME} if $key eq 'NAME';
+	return $sth->{NULLABLE} if $key eq 'NULLABLE';
 	return $sth->{$key} if $key =~ /^wire10_/;
 	return $sth->SUPER::FETCH($key);
 }
@@ -609,6 +619,10 @@ sub STORE {
 
 	if ($key eq 'NAME') {
 		$sth->{NAME} = $value;
+		return 1;
+	}
+	if ($key eq 'NULLABLE') {
+		$sth->{NULLABLE} = $value;
 		return 1;
 	}
 	if ($key =~ /^wire10_/) {
@@ -644,22 +658,37 @@ C<DBD::Wire10> is a Pure Perl interface able to connect to MySQL, Sphinx and Dri
 
   use DBI;
 
-  $drh = DBI->install_driver("wire10");
+  # Connect
+  my ($host, $user, $password, $db) = ('localhost', 'test', 'test', 'test');
+  my $dsn = "DBI:Wire10:host=$host;database=$db";
+  my $dbh = DBI->connect($dsn, $user, $password);
 
-  $dsn = "DBI:Wire10:database=$database;host=$host";
-
-  $dbh = DBI->connect($dsn, $user, $password);
-
-  $sth = $dbh->prepare("SELECT * FROM foo WHERE bar=1");
+  # CREATE TABLE example
+  my $sth = $dbh->prepare("CREATE TABLE foo (id INT, message TEXT)");
   $sth->execute;
-  $numCols = $sth->{NUM_OF_FIELDS};
-  $numRows = $sth->{wire10_selectedrows};
-  $sth->finish;
 
-  $sth = $dbh->prepare("UPDATE foo SET bar=0 WHERE bar=1");
+  # INSERT example
+  $sth = $dbh->prepare("INSERT INTO foo (id, message) VALUES (?, ?)");
+  $sth->execute(1, 'Hello World!');
+  $sth->execute(2, 'Goodbye, Cruel World!');
+  printf "Affected rows: %d\n", $sth->rows;
+
+  # SELECT example
+  $sth = $dbh->prepare("SELECT * FROM foo");
   $sth->execute;
-  $numRows = $sth->rows;
-  $sth->finish;
+  printf "Selected rows: %d / columns: %d\n",
+      $sth->{rows},
+      $sth->{NUM_OF_FIELDS}
+  ;
+  while (my $row = $sth->fetchrow_arrayref()) {
+      printf
+          "Id: %s, Message: %s\n",
+          $row->[0],
+          $row->[1]
+	  ;
+  }
+
+  $dbh->disconnect;
 
 =head1 INSTALLATION
 
@@ -732,7 +761,11 @@ After that you can connect to servers and send queries via a simple object orien
 
 =head1 FEATURES
 
-The following DBI features are supported.
+The following DBI features are supported directly by this driver.  Any DBI feature that internally make use of any of the following features are also supported.
+
+Refer to the L<DBI::DBI> documentation for complete information on all available methods and attributes.
+
+It is unlikely that you will want to make use of any of the methods and attributes documented here as "(internal)", you may want to skip reading about all of these.
 
 =head2 Features in C<DBD::Wire10>
 
@@ -806,6 +839,10 @@ Question marks (?) can be used in place of parameters.  Actual parameters can th
 
 Returns various information about the database server when given a code for the particular information to retrieve.
 
+=head4 last_insert_id
+
+Returns the auto-increment value generated by the last INSERT statement executed.
+
 =head4 commit
 
 Commits the active transaction.
@@ -872,7 +909,7 @@ If enabled, warnings are emitted when unexpected things might occur.
 
 If enabled, the prepared statement stored by the driver upon a call to prepare() is included in the output when an error occurs.
 
-Using absolute notation such as C<SELECT * FROM db.table> rather than C<USE db> combined with C<SELECT * FROM table> will give more precise debug output (and perform better).
+Using absolute notation such as C<SELECT * FROM db.table> rather than C<USE db> combined with C<SELECT * FROM table> will give more precise debug output.
 
 =head4 wire10_timeout
 
@@ -895,10 +932,6 @@ A debug bitmask, which when enabled will spew a lots of messages to the console.
 Contains the auto_increment value for the last row inserted.  Always use $sth->{wire10_insertid} instead, if the $sth object is available, since this value can be overwritten by irrelevant transactions.
 
 Potentially useful for single-threaded applications that make use of DBI commands which does not return $sth objects, such as do().
-
-=head4 wire10_selectedrows (imposed by sth->execute)
-
-Contains the number of rows returned in the last result set.  Always use $sth->{wire10_selectedrows} instead, if the $sth object is available, since this value can be overwritten by irrelevant transactions.
 
 =head4 wire10_warning_count (imposed by sth->execute)
 
@@ -938,17 +971,19 @@ Runs a prepared statement, optionally using parameters.  Parameters are supplied
 
 =head4 cancel
 
-Cancels the currently executing command (query or ping).  Safe to call from another thread, but note that DBI currently prevents this.
+Cancels the currently executing statement (or ping).  Safe to call from another thread, but note that DBI currently prevents this.  Safe to call from a signal handler.
 
-Non-threaded approaches to invoking cancel() such as SIGALRM is generally unsupported by Windows distributions of Perl, so the above affects that query cancelling is only supported on Unix.  A workaround (for this DBD driver) is to grab a reference to the internal driver core and call cancel() on that instead.
-
-Use cancel for interactive code only, where a user may cancel an operation at any time.  Do not use cancel for setting query timeouts.  For that, use the timeout property instead.  The timeout property has slightly better performance, because it does not precipitate creation of an extra thread.
+Use cancel for interactive code only, where a user may cancel an operation at any time.  Do not use cancel for setting query timeouts.  For that, just set the C<wire10_timeout> attribute to an approriate number of seconds.
 
 Always returns 1 (success).  The actual status of the query (finished or cancelled, depending on timing) appears in the thread which is running the actual query.
 
-The driver core fetches all results in execute(), so cancelling later on during a fetch does nothing to the current statement.
+Use C<cancel()> to abort a query when the user presses CTRL-C:
 
-If a cancel happens to be performed after the current command has finished executing, it will instead take effect during the next command.  In that case, the cancel can be forced out of the system with a ping(), or a reconnect() which implicitly does a ping().
+  $SIG{INT} = sub { $sth->cancel; $dbh->reconnect; };
+
+Notice that the driver core will terminate the connection when a C<cancel()> is performed.  A call to C<reconnect()> is thus required after a statement has been cancelled to reestablish the connection.
+
+If a cancel happens to be performed after the current command has finished executing, it will instead take effect during the next command.  To avoid that happening during the next user query, a cancel can be forced out of the system with a C<ping()> (or a C<reconnect()> which implicitly does a C<ping()>).
 
 =head4 finish
 
@@ -957,6 +992,8 @@ Clears out the resources used by a statement.  This is called automatically at t
 =head4 fetchrow_arrayref
 
 Fetch one row as an array.
+
+There is a multitude of other fetch methods available, such as C<fetchrow_hashref>.  These methods are implemented in DBI, they internally make use of C<fetchrow_arrayref> to retrieve result data.  Refer to the DBI documentation for more information on the various fetch methods.
 
 =head4 fetch
 
@@ -985,12 +1022,6 @@ Used internally to destroy the object.
 Contains the auto_increment value for the last row inserted.
 
   my $id = $sth->{wire10_insertid};
-
-=head4 wire10_selectedrows
-
-Contains the number of rows returned in the last result set.
-
-  my $numRows = $sth->{wire10_selectedrows};
 
 =head4 wire10_streaming
 
@@ -1024,6 +1055,10 @@ Returns the number of columns in the result set after a query has been executed.
 
 Returns the names of all the columns in the result set after a query has been executed.
 
+=head4 NULLABLE
+
+Returns an array indicating for each column whether it has a NOT NULL constraint.
+
 =head4 Active (internal)
 
 Used internally to notify DBI that the statement has an active result iterator.
@@ -1048,164 +1083,46 @@ Used internally to store the number of affected rows.
 
 =head2 Supported operating systems and Perl versions
 
-This module has been tested on these OSes.
-
-=over 4
-
-=item * Windows Server 2008
-
-with ActivePerl 5.10.0 build 1004, 32 and 64-bit
-
-The build script dependencies do not contain any version numbers, because
-nobody has any clue what the minimum requirements are for using this package.
-It is very recommendable, however, not to mix and match versions of C<Net::Wire10>
-and C<DBD::Wire10>.  For best results use the newest version of both packages.
-
 Over at CPAN Testers, there's a vast number of testers that do
 a very good job of figuring out which versions work together:
+
 L<http://static.cpantesters.org/distro/N/DBD-Wire10.html>
 
-Feel free to send in reports of success or failure using different platforms.
-
-=back
-
-=head2 Unsupported features
-
-DBI has a rich set of reference features, some of which are not implemented by each individual driver.
-
-In general, it should be possible to check for particular features before using them with the can() method, available on all types of DBI handles, and raise an error if a required feature is not supported.
-
-Here is a list of some notable features that this driver does not yet have.
-
-See also the documentation for L<Net::Wire10/Unsupported features> for limitations in the driver core.
-
-=head3 Unsupported database server connection features in C<DBD::Wire10::db>
-
-The following methods are supposed to be implemented by the DBD connection, but is not (yet) supported in this driver.  For an up-to-date list, see the DBI documentation.
-
-=over 4
-
-=item * type_info_all
-
-=item * type_info
-
-=item * table_info (and tables)
-
-    @names = $dbh->tables;
-
-Should return a list of table and view names, possibly including a schema prefix. This list should include all tables that can be used in a "SELECT" statement without further qualification.
-
-=item * column_info
-
-=item * primary_key_info (and primary_key)
-
-=item * foreign_key_info
-
-=item * statistics_info
-
-=item * list_tables
-
-=item * last_insert_id
-
-=back
-
-The following attributes are supposed to be implemented by each DBD driver, but is not (yet) supported in this driver.  For an up-to-date list, see the DBI documentation.
-
-=over 4
-
-=item * Name
-
-=item * RowCacheSize
-
-=item * LongReadLen
-
-=item * LongTruncOk
-
-=back
-
-=head3 Unsupported statement features in C<DBD::Wire10::st>
-
-The following methods are supposed to be implemented by each DBD driver, but is not (yet) supported in this driver.  For an up-to-date list, see the DBI documentation.
-
-=over 4
-
-=item * bind_col
-
-=item * bind_columns
-
-=item * bind_param_inout
-
-=back
-
-The following attributes are supposed to be implemented by each DBD driver, but is not (yet) supported in this driver.  For an up-to-date list, see the DBI documentation.
-
-=over 4
-
-=item * TYPE
-
-=item * PRECISION
-
-=item * SCALE
-
-=item * NULLABLE
-
-=item * CursorName
-
-=item * RowsInCache
-
-=item * ParamValues
-
-=item * ParamArrays
-
-=item * ParamTypes
-
-=back
-
-=head2 Supported workarounds
-
-=head3 Using tokens for LIMITs in prepared statements
-
-MySQL Server chokes if you give it LIMIT parameters that are properly quoted.  As a workaround, this DBD driver scans all field values given to it, and when a purely numerical value is found, it is not quoted.
-
 =head2 Differences from DBD-MySQL
+
+=head3 Unicode always enabled
+
+This driver always runs in a mode where international characters outside of the currently active ANSI code page are supported.
 
 =head3 Binary data must be bound
 
 Binary/BLOB data must be given as a bound parameter (see C<bind_param>) using fx. the C<SQL_BLOB> flag.  When using any other method, strings will as a default be interpreted as text.
 
-=head3 Finding the number of selected rows
-
-The C<rows> attribute on a statement always returns -1, as specified in the DBI documentation.  A custom attribute, C<wire10_selectedrows>, is available to retrieve the number of selected rows.
-
-The same applies to the return value of C<execute('SELECT * FROM ...')>.  B<DBD::Wire10> returns true on success, and false on failure, as specified in DBI documentation.  This differs from B<DBD::mysql>, which returns the number of selected rows.
-
-To get the number of rows from a SELECT statement, use this:
-
-  my $numRows = $sth->{wire10_selectedrows};
-
-If streaming is turned on for the statement, the number of rows selected is unknown and the above always returns -1.
-
-The wire protocol does not have any means by which the server can tell the client how many rows are in the result set, even if the server should discover this at some point.  Therefore the row count is only available after the entire result set has been pulled down to the client.
-
-=head3 Enabling streaming
-
-The C<mysql_use_result> attribute is unavailable.  Another attribute, C<wire10_streaming>, does exactly the same.
-
-=head3 Flipping result set with more_results()
-
-The C<more_results()> method currently does nothing, because the underlying driver does not yet support queries that return multiple result sets.
-
-As an alternative, grab two (or more) connections from the connection pool and execute one query on each connection simultaneously.  This also has the advantage that the queries can be executed in parallel.
-
-=head3 No implicit reconnects
+=head3 Automatic reconnect
 
 Automatic reconnection is not performed when a connection fails mid-execution.  The corresponding DBD-MySQL options C<auto_reconnect> and C<mysql_init_command> are therefore unavailable.
 
 The driver expects you to call C<reconnect()> at any time you wish to check the connection status and (if need be) reestablish a connection with the server.
 
-=head3 No type guessing
+A good time and place to add a call to C<reconnect()> could be when a connection is first used after a long period of inactivity, plus at any point in your code where it is safe and appropriate to restart processing when an error occurs.
 
-No automatic conversion between types are done.  Weird string values are not interpreted as numbers when bound and specified as SQL_INTEGER, and vice-versa.
+=head3 Automatic numerical trim
+
+Numerical string values bound via C<bind_param()> and provided via C<execute()> parameters are not automatically trimmed of whitespace, even if they look like numbers.
+
+=head3 Various missing protocol features
+
+Various connection methods and other protocol features are not supported by the underlying driver.  See the "Unsupported features" chapter in the L<Net::Wire10> documentation for more information.
+
+=head3 Supported DBI methods and attributes
+
+Some methods are not yet supported in this driver, in particular type_info_all, table_info, column_info, primary_key_info and foreign_key_info.  Some attributes are not yet supported, in particular TYPE.
+
+=head3 Supported C<mysql_> attributes
+
+All of the C<mysql_> attributes are unavailable.  DBI requires that each driver uses a unique prefix, therefore this driver supports only attributes named C<wire10_>.
+
+Not all C<mysql_> attributes have equivalently named C<wire10_> attributes.  For example, there is no C<mysql_use_result> attribute, but one called C<wire10_streaming> does exactly the same.
 
 =head2 Dependencies
 
