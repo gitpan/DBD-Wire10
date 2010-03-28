@@ -12,7 +12,7 @@ use warnings;
 use DBI;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '1.06';
+$VERSION = '1.07';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -342,15 +342,13 @@ sub last_insert_id {
 	return $dbh->FETCH('wire10_insertid')
 }
 
-# TODO: Support more get_info properties.
+# TODO: Support more get_info properties as needed.
 sub get_info {
 	my $dbh = shift;
 	my $type = shift;
 	# 17: SQL_DBMS_NAME
 	# Difficult to return something intelligent here, the server
-	# only reports a version, not a daemon name in the handshake
-	# packet.  A SELECT could be constructed to reveal the server
-	# type, if necessary.
+	# only reports a version, not a daemon name in the handshake.
 	return 'Wire10' if $type == 17;
 	# 18: SQL_DBMS_VER
 	return $dbh->FETCH('wire10_server_version') if $type == 18;
@@ -363,7 +361,7 @@ sub get_info {
 	# (The server happily accepts, discards and prints a catalog named
 	#  'def', though.)
 	return 0 if $type == 114;
-	# Unknown/unsupported attribute.
+	# Return undef for unknown and unsupported attributes.
 	return undef;
 }
 
@@ -971,7 +969,7 @@ Runs a prepared statement, optionally using parameters.  Parameters are supplied
 
 =head4 cancel
 
-Cancels the currently executing statement (or ping).  Safe to call from another thread, but note that DBI currently prevents this.  Safe to call from a signal handler.
+Cancels the currently executing statement (or other blocking protocol command, such as C<ping()>).  Safe to call from another thread, but note that DBI currently prevents this.  Safe to call from a signal handler.
 
 Use cancel for interactive code only, where a user may cancel an operation at any time.  Do not use cancel for setting query timeouts.  For that, just set the C<wire10_timeout> attribute to an approriate number of seconds.
 
@@ -979,11 +977,32 @@ Always returns 1 (success).  The actual status of the query (finished or cancell
 
 Use C<cancel()> to abort a query when the user presses CTRL-C:
 
-  $SIG{INT} = sub { $sth->cancel; $dbh->reconnect; };
+  $SIG{INT} = sub { $sth->cancel; };
 
-Notice that the driver core will terminate the connection when a C<cancel()> is performed.  A call to C<reconnect()> is thus required after a statement has been cancelled to reestablish the connection.
+Notice that the driver core will terminate the connection when a C<cancel()> is performed.  A call to C<reconnect()> is thus required after a statement has been cancelled in order to reestablish the connection.
 
-If a cancel happens to be performed after the current command has finished executing, it will instead take effect during the next command.  To avoid that happening during the next user query, a cancel can be forced out of the system with a C<ping()> (or a C<reconnect()> which implicitly does a C<ping()>).
+  $SIG{INT} = sub { $sth->cancel; };
+  $sth->execute;
+  $dbh->reconnect;
+
+If a cancel happens to be performed after the current command has finished executing (in a so-called race condition), it will instead take effect during the next command.  To avoid that the next user query is unduly aborted, a cancel can be forced out of the system with a C<ping()> (or a C<reconnect()> which implicitly does a C<ping()>, or with any other blocking protocol command).  In the example above, C<reconnect()> is always performed, thus solving the problem posed by this race condition.
+
+If C<RaiseError> is enabled, an error will be raised during C<execute()> whenever the query is cancelled.  This can be handled with an eval, for example:
+
+  $SIG{INT} = sub { $sth->cancel; };
+  eval { $sth->execute; };
+  print $@ if $@;
+  $dbh->reconnect;
+
+In the above, a C<cancel()> (or any error condition occurring during execution) are handled by printing the error message to the console (disable C<PrintError> to avoid seeing the message twice).
+
+As a final tip, if you want to restore normal signal handling when a user query is not executing, use a value of 'DEFAULT' for the handler:
+
+  $SIG{INT} = sub { $sth->cancel; };
+  eval { $sth->execute; };
+  print $@ if $@;
+  $SIG{INT} = 'DEFAULT';
+  $dbh->reconnect;
 
 =head4 finish
 
