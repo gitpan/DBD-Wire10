@@ -29,19 +29,26 @@ use Module::Build;
 # yet another mimeographic labor-phlebotomiser of a file format :-).
 #
 
+#
+# Note:
+# DBI is technically not a requirement, only DBI::PurePerl is.
+#
+# Rather than having the package manager take care of installing
+# the best available version of DBI, various hacks and Makefile magic
+# is used to force the XS version and the PurePerl version of DBI
+# into the same package called DBI.  Therefore you will only see DBI
+# in the list below, not DBI::PurePerl.
+
 my $builder = Module::Build->new(
 	module_name             => 'DBD::Wire10',
 	license                 => 'perl',
 	dist_version_from       => 'lib/DBD/Wire10.pm',
 	build_requires => {
-		'Test::More'         => 0.0,
+		'Test::More'             => 0.0,
 	},
 	requires => {
-		'DBI::PurePerl'      => 0.0,
-		'Net::Wire10'        => 0.0,
-	},
-	recommends => {
-		'DBI'                => 0.0,
+		'DBI'                    => 0.0,
+		'Net::Wire10'            => 0.0,
 	},
 	create_makefile_pl => 'traditional',
 );

@@ -12,7 +12,7 @@ use warnings;
 use DBI;
 use vars qw($VERSION $err $errstr $state $drh);
 
-$VERSION = '1.07';
+$VERSION = '1.08';
 $err = 0;
 $errstr = '';
 $state = undef;
@@ -115,19 +115,18 @@ sub connect {
 
 	my $dbh = DBI::_new_dbh($drh, { Name => $dsn });
 	eval {
-		# TODO: Probably necessary to tell perl to allow sharing
-		#       the imp_data object between threads somehow,
-		#       see note in take_imp_data().
+		# See note in take_imp_data().
 		my $wire = delete $attrhash->{dbi_imp_data};
 		unless (defined $wire) {
 			$wire = Net::Wire10->new(
-				host     => $data_source_info->{host},
-				port     => $data_source_info->{port},
-				database => $data_source_info->{database},
-				user     => $user,
-				password => $password,
-				debug    => $attrhash->{wire10_debug} || undef,
-				timeout  => $attrhash->{wire10_timeout} || undef,
+				host            => $data_source_info->{host},
+				port            => $data_source_info->{port},
+				database        => $data_source_info->{database},
+				user            => $user,
+				password        => $password,
+				debug           => $attrhash->{wire10_debug} || undef,
+				connect_timeout => $attrhash->{wire10_connect_timeout} || undef,
+				query_timeout   => $attrhash->{wire10_query_timeout} || undef,
 			);
 			$wire->connect;
 		};
@@ -191,15 +190,29 @@ sub STORE {
 
 	if ($key =~ /^AutoCommit$/) {
 		my $wire = $dbh->FETCH('wire10_driver_dbh');
-		$wire->query("SET AUTOCOMMIT=".$value);
+		eval {
+			$wire->query("SET AUTOCOMMIT=".$value);
+		};
+		if ($@) {
+			die $@ unless $wire->is_connected;
+			if ($dbh->FETCH('Warn')) {
+				warn "Server does not allow setting AUTOCOMMIT: $@";
+			}
+		}
 		# Can't store as AutoCommit via SUPER::STORE, not sure why.
 		$dbh->STORE('wire10_autocommit', $value);
 		return 1;
 	}
 
-	if ($key =~ /^(?:wire10_timeout)$/) {
+	if ($key =~ /^(?:wire10_connect_timeout)$/) {
 		my $wire = $dbh->FETCH('wire10_driver_dbh');
-		$wire->{timeout} = $value;
+		$wire->{connect_timeout} = $value;
+		return 1;
+	}
+
+	if ($key =~ /^(?:wire10_query_timeout)$/) {
+		my $wire = $dbh->FETCH('wire10_driver_dbh');
+		$wire->{query_timeout} = $value;
 		return 1;
 	}
 
@@ -221,9 +234,13 @@ sub FETCH {
 	my $dbh = shift;
 	my $key = shift;
 
-	if ($key =~ /^(?:wire10_timeout)$/) {
+	if ($key =~ /^(?:wire10_connect_timeout)$/) {
 		my $wire = $dbh->FETCH('wire10_driver_dbh');
-		return $wire->{timeout};
+		return $wire->{connect_timeout};
+	}
+	if ($key =~ /^(?:wire10_query_timeout)$/) {
+		my $wire = $dbh->FETCH('wire10_driver_dbh');
+		return $wire->{query_timeout};
 	}
 	if ($key =~ /^(?:wire10_debug)$/) {
 		my $wire = $dbh->FETCH('wire10_driver_dbh');
@@ -381,15 +398,18 @@ sub take_imp_data {
 	# Remove reference to dbh from drh, probably also destroys dbh.
 	$dbh->SUPER::take_imp_data;
 
-	# TODO: Probably necessary to tell perl to allow sharing of imp_data
-	#       between threads somehow, either via threads::shared::share()
-	#       which unfortunately requires you to manually walk the entire
-	#       tree of objects, or via Storable::{freeze,thaw}() which
-	#       unfortunately needs you to manually handle all typeglobs.
+	# Note: It would be nice to serialize or tie the core such that
+	#       it can be be shared among interpreters running in different
+	#       processes or threads.  Unfortunately, neither of the available
+	#       modules, Storable and threads::shared, seem to be able to
+	#       cope with socket handles:
 	#
-	#       Either dependency would perhaps defeat the some of the
-	#       purpose of having a pure perl database driver, since both
-	#       threads::shared and Storable are partly written in C.
+	#       Storable error: "Can't store GLOB items"
+	#       threads::shared error: "Invalid value for shared scalar"
+	#
+	#       For now, we just return the core driver and expect that the
+	#       caller serialize and deserialize the object if the caller needs
+	#       to use it from a different context.
 
 	# Return the core driver.
 	return $wire;
@@ -692,8 +712,8 @@ C<DBD::Wire10> is a Pure Perl interface able to connect to MySQL, Sphinx and Dri
 
 DBD::Wire10 is installed like any other CPAN module:
 
-  $ perl -MCPAN -e shell
-  cpan> install DBD::Wire10
+  $ perl -MCPANPLUS -eshell
+  CPAN Terminal> install DBD::Wire10
 
 For Perl installations where the CPAN module (used above) is missing, you can also just download the .tar.gz from this site and drop the B<DBD> folder in the same folder as the Perl file you want to use the connector from.
 
@@ -763,7 +783,7 @@ The following DBI features are supported directly by this driver.  Any DBI featu
 
 Refer to the L<DBI::DBI> documentation for complete information on all available methods and attributes.
 
-It is unlikely that you will want to make use of any of the methods and attributes documented here as "(internal)", you may want to skip reading about all of these.
+It is unlikely that you will want to make use of any of the methods and attributes documented here as "(internal)", you can probably skip reading about those.
 
 =head2 Features in C<DBD::Wire10>
 
@@ -774,10 +794,6 @@ Methods available from the C<DBD::Wire10> driver factory.
 =head4 driver (internal)
 
 Creates a new driver.
-
-=head4 CLONE (internal)
-
-Helper that decouples non-shareable driver internals when the application needs to create a new process using fork().
 
 =head2 Features in C<DBD::Wire10::dr>
 
@@ -793,11 +809,11 @@ A DSN is specified in the usual format and connect() is called via DBI:
   my $options = {'RaiseError'=>1, 'Warn'=>1};
   my $dbh = DBI->connect($dsn, $user, $password, $options);
 
-The default port numbers are 3306 for MySQL Server, 3307 for Sphinx and 4427 for Drizzle.  Some server types support multiple protocols, in which case they may also listen on other, unrelated ports.
+The default port numbers are 3306 for MySQL Server, 9306 for Sphinx and 4427 for Drizzle.  Some server types support multiple protocols, in which case they may also listen on other, unrelated ports.
 
 C<wire10_debug> can be specified in the attribute hash for very noise debug output.  It is a bitmask, where 1 shows normal debug messages, 2 shows messages flowing back and forth between client and server, and 4 shows raw TCP traffic.
 
-C<wire10_timeout> can be specified in the attribute hash to set a connect and query timeout.  Otherwise, the driver's default values are used.
+C<wire10_connect_timeout> and C<wire10_query_timeout> can be specified in the attribute hash to set a connect and query timeout.  Otherwise, the driver's default values are used.
 
 C<Warn> can be specified to 1 in the attribute hash to output warnings when some silly things are attempted.
 
@@ -820,8 +836,6 @@ Some methods have default implementations in DBI, those are not listed here.  Re
 =head4 quote
 
 Quotes a string literal.
-
-MySQL Server chokes if you give it LIMIT parameters that are properly quoted.  To work around this, the quote() method specifically does not quote purely numerical values.  To quote all values, including numerical values, use Net::Wire10::Util::quote().
 
 =head4 quote_identifier
 
@@ -861,7 +875,7 @@ Sends a ping over the network protocol.  An error is reported via the standard D
 
 Makes sure that there is a connection to the database server.  If there is no connection, and the attempt to reconnect fails, an error is reported via the standard DBI error reporting mechanism.
 
-Notice that the timeout when calling this method is in a sense doubled.  reconnect() first performs a ping() if the connection seems to be alive.  If the ping fails after C<timeout> seconds, then a new underlying connection is established, and establishing this connection could last an additional C<timeout> seconds.
+Notice that the timeout when calling this method is in a sense doubled.  reconnect() first performs a ping() if the connection seems to be alive.  If the ping fails after C<wire10_connect_timeout> seconds, then a new underlying connection is established, and establishing this connection could last an additional C<wire10_connect_timeout> seconds.
 
 =head4 err
 
@@ -878,18 +892,6 @@ Contains an error message when an error has happened.  Always use RaiseError and
 =head4 take_imp_data (internal)
 
 Retrieves a reference to the core driver object and nukes the DBI handle that previously owned it.
-
-=head4 STORE (internal)
-
-Used internally to store attributes.
-
-=head4 FETCH (internal)
-
-Used internally to fetch attributes.
-
-=head4 DESTROY (internal)
-
-Used internally to destroy the object.
 
 =head3 I<Database server connection>: attributes
 
@@ -909,9 +911,13 @@ If enabled, the prepared statement stored by the driver upon a call to prepare()
 
 Using absolute notation such as C<SELECT * FROM db.table> rather than C<USE db> combined with C<SELECT * FROM table> will give more precise debug output.
 
-=head4 wire10_timeout
+=head4 wire10_connect_timeout
 
-The timeout, in seconds, before the driver stops waiting for data from the network when executing a command or connecting to a server.
+The timeout, in seconds, before the driver stops waiting for data from the network when connecting to a server.
+
+=head4 wire10_query_timeout
+
+The timeout, in seconds, before the driver stops waiting for data from the network when executing a query.
 
 =head4 wire10_thread_id
 
@@ -924,28 +930,6 @@ Returns the server version of the currently connected-to server.
 =head4 wire10_debug
 
 A debug bitmask, which when enabled will spew a lots of messages to the console.  1 shows normal debug messages, 2 shows messages flowing back and forth between client and server, and 4 shows raw TCP traffic.
-
-=head4 wire10_insertid (imposed by sth->execute)
-
-Contains the auto_increment value for the last row inserted.  Always use $sth->{wire10_insertid} instead, if the $sth object is available, since this value can be overwritten by irrelevant transactions.
-
-Potentially useful for single-threaded applications that make use of DBI commands which does not return $sth objects, such as do().
-
-=head4 wire10_warning_count (imposed by sth->execute)
-
-Contains the number of warnings produced by the last query.  Always use $sth->{wire10_warning_count} instead, if the $sth object is available, since this value can be overwritten by irrelevant transactions.
-
-=head4 Active (internal)
-
-Used internally to notify DBI that connect() has been called and disconnect() has not.
-
-=head4 wire10_driver_dbh (internal)
-
-This is the internal handle for the core driver object associated with the DBI connection.
-
-=head4 wire10_autocommit (internal)
-
-Used internally to store the current AutoCommit setting.
 
 =head2 Features in C<DBD::Wire10::st>
 
@@ -971,38 +955,23 @@ Runs a prepared statement, optionally using parameters.  Parameters are supplied
 
 Cancels the currently executing statement (or other blocking protocol command, such as C<ping()>).  Safe to call from another thread, but note that DBI currently prevents this.  Safe to call from a signal handler.
 
-Use cancel for interactive code only, where a user may cancel an operation at any time.  Do not use cancel for setting query timeouts.  For that, just set the C<wire10_timeout> attribute to an approriate number of seconds.
+Use cancel for interactive code only, where a user may cancel an operation at any time.  Do not use cancel for setting query timeouts.  For that, just set the C<wire10_query_timeout> attribute to an appropriate number of seconds.
 
-Always returns 1 (success).  The actual status of the query (finished or cancelled, depending on timing) appears in the thread which is running the actual query.
+Always returns 1 (success).  The actual status of the query (finished or cancelled, depending on timing) appears in the thread which is running the query.
 
 Use C<cancel()> to abort a query when the user presses CTRL-C:
 
   $SIG{INT} = sub { $sth->cancel; };
 
-Notice that the driver core will terminate the connection when a C<cancel()> is performed.  A call to C<reconnect()> is thus required after a statement has been cancelled in order to reestablish the connection.
+Notice that the driver core will terminate the connection when a C<cancel()> is performed.  A call to C<reconnect()> is thus required after a statement has been cancelled in order to reestablish the connection:
 
-  $SIG{INT} = sub { $sth->cancel; };
-  $sth->execute;
+  {
+    local $SIG{INT} = sub { $sth->cancel; };
+    $sth->execute;
+  }
   $dbh->reconnect;
 
-If a cancel happens to be performed after the current command has finished executing (in a so-called race condition), it will instead take effect during the next command.  To avoid that the next user query is unduly aborted, a cancel can be forced out of the system with a C<ping()> (or a C<reconnect()> which implicitly does a C<ping()>, or with any other blocking protocol command).  In the example above, C<reconnect()> is always performed, thus solving the problem posed by this race condition.
-
-If C<RaiseError> is enabled, an error will be raised during C<execute()> whenever the query is cancelled.  This can be handled with an eval, for example:
-
-  $SIG{INT} = sub { $sth->cancel; };
-  eval { $sth->execute; };
-  print $@ if $@;
-  $dbh->reconnect;
-
-In the above, a C<cancel()> (or any error condition occurring during execution) are handled by printing the error message to the console (disable C<PrintError> to avoid seeing the message twice).
-
-As a final tip, if you want to restore normal signal handling when a user query is not executing, use a value of 'DEFAULT' for the handler:
-
-  $SIG{INT} = sub { $sth->cancel; };
-  eval { $sth->execute; };
-  print $@ if $@;
-  $SIG{INT} = 'DEFAULT';
-  $dbh->reconnect;
+If a cancel happens to be performed after the current command has finished executing (in a so-called race condition), it will instead take effect during the next command.  To avoid that the next user query is unduly aborted, a cancel can be flushed out of the system with a C<ping()> (or a C<reconnect()> which implicitly does a C<ping()>).  In the example above, C<reconnect()> is always performed, thus resolving the race condition.
 
 =head4 finish
 
@@ -1021,18 +990,6 @@ Deprecated alias for fetchrow_arrayref.
 =head4 rows
 
 The number of affected rows after an UPDATE or similar query, or the number of rows so far read by the client during a SELECT or similar query.
-
-=head4 STORE (internal)
-
-Used internally to store attributes.
-
-=head4 FETCH (internal)
-
-Used internally to fetch attributes.
-
-=head4 DESTROY (internal)
-
-Used internally to destroy the object.
 
 =head3 I<Statement>: attributes
 
@@ -1077,26 +1034,6 @@ Returns the names of all the columns in the result set after a query has been ex
 =head4 NULLABLE
 
 Returns an array indicating for each column whether it has a NOT NULL constraint.
-
-=head4 Active (internal)
-
-Used internally to notify DBI that the statement has an active result iterator.
-
-=head4 wire10_driver_sth (internal)
-
-Used internally to store a reference to the core driver object.
-
-=head4 wire10_iterator (internal)
-
-Used internally to store a reference to the active result iterator, if any.
-
-=head4 wire10_prepared (internal)
-
-Used internally to store a reference to the prepared statement created by the core driver.
-
-=head4 wire10_rows (internal)
-
-Used internally to store the number of affected rows.
 
 =head1 TROUBLESHOOTING
 
